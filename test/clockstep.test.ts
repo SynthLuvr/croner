@@ -17,10 +17,11 @@ import { Cron } from "../src/croner.ts";
 test("clock step forward between arming reads must not skip the occurrence", async () => {
   const RealDate = Date;
 
-  // Fire once a minute, ~5 seconds out, so the initial arming lands inside the
-  // final <= 30 s polling window
+  // Fire once a minute, ~2 seconds out, so the initial arming lands inside the
+  // final <= 30 s polling window, while the whole test stays well below the 5 s
+  // default per-test timeout of bun:test (which @cross/test cannot override)
   const nowReal = new RealDate();
-  const targetSecond = (nowReal.getSeconds() + 5) % 60;
+  const targetSecond = (nowReal.getSeconds() + 2) % 60;
   const pattern = `${targetSecond} * * * * *`;
 
   // Precompute the expected occurrence in real time, so the assertion does not
@@ -76,10 +77,18 @@ test("clock step forward between arming reads must not skip the occurrence", asy
       fired++;
     });
 
-    // Wait, in real time, until just past the occurrence
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, Math.max(0, targetMs - RealDate.now()) + 4_000);
-    });
+    // Wait, in real time, until the occurrence has fired, keeping the wait
+    // bounded: bun:test fails any test running longer than 5 s, and @cross/test
+    // cannot raise that limit, so poll for the fire instead of sleeping way
+    // past the occurrence. A build that skips the occurrence stays unfired
+    // until the deadline (the next one is a minute away), while a working
+    // build fires at, or just before, the occurrence.
+    const deadline = targetMs + 1_500;
+    while (RealDate.now() < deadline && fired === 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+    // Give a same-tick duplicate fire a moment to surface before asserting
+    await new Promise<void>((resolve) => setTimeout(resolve, 400));
 
     assertEquals(
       fired,
