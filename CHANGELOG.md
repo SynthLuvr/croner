@@ -29,6 +29,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Fixed silent skipping of a scheduled occurrence when the system clock is stepped forward (NTP
+  correction, WSL2 host clock resync, ...) between the clock readings used while arming the timer.
+  The trigger delay and the trigger target are now derived from a single clock reading, shared
+  between the trigger check and the re-arming, so a stepped-over occurrence fires late instead of
+  being skipped (#343, #370).
 - Fixed `RangeError` when using stepping with year field wildcard (for example `*/2` in year field).
 - Fixed negative-delay scheduling behavior that could overflow in some runtimes and block expected
   catch-up execution.

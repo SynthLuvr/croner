@@ -225,10 +225,15 @@ class Cron<T = undefined> {
    * Find next runtime, based on supplied date. Strips milliseconds.
    *
    * @param prev - Optional. Date to start from. Can be a CronDate, Date object, or a string representing a date.
+   * @param now - Optional. Clock reading used when no previous run is supplied, so callers can
+   *              derive the next run, and the time left until it, from a single reading.
    * @returns The next run time as a Date object, or null if there is no next run.
    */
-  public nextRun(prev?: CronDate<T> | Date | string | null): Date | null {
-    const next = this._next(prev);
+  public nextRun(
+    prev?: CronDate<T> | Date | string | null,
+    now?: Date,
+  ): Date | null {
+    const next = this._next(prev, now);
     if (!next) return null;
 
     return this.applyDayOffset(next.getDate(false));
@@ -485,8 +490,10 @@ class Cron<T = undefined> {
    * Schedule a new job
    *
    * @param func - Function to be run each iteration of pattern
+   * @param now - Optional clock reading to schedule from, reused from the trigger check
+   *              so a clock step in between cannot skip an occurrence
    */
-  public schedule(func?: CronCallback<T>): Cron<T> {
+  public schedule(func?: CronCallback<T>, now?: Date): Cron<T> {
     // If a function is already scheduled, bail out
     if (func && this.fn) {
       throw new Error(
@@ -498,25 +505,25 @@ class Cron<T = undefined> {
       this.fn = func;
     }
 
-    // Get actual ms to next run, bail out early if any of them is null (no next run)
-    let waitMs = this.msToNext();
+    // Derive the delay and the trigger target from a single clock reading. With separate reads, a
+    // forward clock step (NTP correction, host resync) between them could make the timer skip the
+    // occurrence it was armed for (#343, #370).
+    const currentTime = now ?? new Date();
 
     // Get the target date based on previous run
-    const target = this.nextRun(this._states.currentRun);
+    const target = this.nextRun(this._states.currentRun, currentTime);
 
-    // isNaN added to prevent infinite loop
-    if (waitMs === null || waitMs === undefined || isNaN(waitMs) || target === null) return this;
+    // Bail out if there is no next run; isNaN guards against unresolvable targets
+    if (target === null || isNaN(target.getTime())) return this;
 
-    // setTimeout cant handle more than Math.pow(2, 32 - 1) - 1 ms
-    if (waitMs > maxDelay) {
-      waitMs = maxDelay;
-    }
-
-    // Clamp negative delays to 0 - some runtimes (e.g. Deno) treat large negative values
-    // as large positive delays due to 32-bit integer overflow, causing jobs with allowPast:true
-    // and a far-past date to never fire. Use a backoff when paused to avoid a tight loop.
-    if (waitMs < 0) {
-      waitMs = this._states.paused ? 1000 : 0;
+    // A negative delay (overdue run) means an immediate check, and longer delays are capped since
+    // setTimeout overflows past its maximum delay. Negative values must be clamped because some
+    // runtimes (e.g. Deno) treat large negative values as large positive delays due to 32-bit
+    // integer overflow, causing jobs with allowPast:true and a far-past date to never fire.
+    // Use a backoff when paused to avoid a tight loop.
+    let waitMs = Math.min(Math.max(target.getTime() - currentTime.getTime(), 0), maxDelay);
+    if (waitMs === 0 && this._states.paused) {
+      waitMs = 1000;
     }
 
     // Start the timer loop
@@ -612,14 +619,18 @@ class Cron<T = undefined> {
       }
     }
 
-    // Always reschedule
-    this.schedule();
+    // Always reschedule, anchored to the same clock reading as the trigger check,
+    // so a clock step in between cannot skip an occurrence
+    this.schedule(undefined, now);
   }
 
   /**
    * Internal version of next. Cron needs millseconds internally, hence _next.
    */
-  private _next(previousRun?: CronDate<T> | Date | string | null) {
+  private _next(
+    previousRun?: CronDate<T> | Date | string | null,
+    now?: Date,
+  ) {
     let hasPreviousRun = (previousRun || this._states.currentRun) ? true : false;
 
     // If no previous run, and startAt and interval is set, calculate when the last run should have been
@@ -629,8 +640,9 @@ class Cron<T = undefined> {
       startAtInFutureWithInterval = (!previousRun) ? true : false;
     }
 
-    // Ensure previous run is a CronDate
-    previousRun = new CronDate<T>(previousRun, this.getTz());
+    // Ensure previous run is a CronDate, anchored at the caller's clock reading
+    // when no previous run is known, so delay and target can come from one read
+    previousRun = new CronDate<T>(previousRun ?? now, this.getTz());
 
     // Previous run should never be before startAt
     if (
