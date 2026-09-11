@@ -5,6 +5,11 @@ All notable changes to Croner will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Silent skip of an occurrence when the system clock is stepped forward (NTP corrections, WSL2 host clock resync, ...) between the clock readings used while arming the timer. The trigger delay and the trigger target are now derived from a single clock reading, shared between the trigger check and the re-arming, so a stepped-over occurrence fires (late) instead of being skipped (#343, #370)
+
 ## [10.0.1] - 2026-02-01
 
 ### Fixed
