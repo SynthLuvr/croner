@@ -225,14 +225,11 @@ class Cron<T = undefined> {
    * Find next runtime, based on supplied date. Strips milliseconds.
    *
    * @param prev - Optional. Date to start from. Can be a CronDate, Date object, or a string representing a date.
-   * @param now - Optional clock reading to search from when no previous run is supplied, so callers
-   *               can derive both the target and the delay from a single reading.
+   * @param now - Optional clock reading used when no previous run is supplied, letting callers
+   *               derive both the target and its delay from a single reading.
    * @returns The next run time as a Date object, or null if there is no next run.
    */
-  public nextRun(
-    prev?: CronDate<T> | Date | string | null,
-    now?: Date,
-  ): Date | null {
+  public nextRun(prev?: CronDate<T> | Date | string | null, now?: Date): Date | null {
     const next = this._next(prev, now);
     if (!next) return null;
 
@@ -240,28 +237,24 @@ class Cron<T = undefined> {
   }
 
   /**
-   * Internal timer target: the next occurrence of the (dayOffset-)shifted schedule
-   * after `now`, derived from the same single clock reading as the delay.
+   * Timer target for schedule(): the next occurrence of the dayOffset-shifted schedule
+   * after `now`.
    *
-   * `nextRun()` applies dayOffset for presentation, which would desync the timer
-   * target from the wall clock: a negative offset keeps the target in the past
-   * (waitMs clamps to 0, hot-looping) and a positive one keeps it forever ahead.
-   * Instead, the pattern walk is anchored at the inverse-shifted previous run and
-   * clock reading, and the offset is re-applied to the result, yielding a real
-   * point in time the wall clock can reach. With no dayOffset this is plain
-   * `_next()`.
+   * `nextRun()` is not usable here — its dayOffset-shifted presentation value would desync
+   * the timer from the wall clock: a negative offset keeps the target in the past (waitMs
+   * clamps to 0, hot-looping) and a positive one keeps it forever ahead (stalling). The
+   * pattern walk is therefore anchored at the inverse-shifted previous run and clock
+   * reading, and the offset re-applied to the result — a point in time the wall clock
+   * can actually reach.
    */
-  private _nextTarget(
-    prev: CronDate<T> | undefined,
-    now: Date,
-  ): Date | null {
+  private _nextTarget(prev: CronDate<T> | undefined, now: Date): Date | null {
     const offsetMs = (this.options.dayOffset ?? 0) * 24 * 60 * 60 * 1000;
     const next = this._next(
-      offsetMs && prev ? new Date(prev.getTime() - offsetMs) : prev,
-      offsetMs ? new Date(now.getTime() - offsetMs) : now,
+      prev ? new Date(prev.getTime() - offsetMs) : undefined,
+      new Date(now.getTime() - offsetMs),
     );
     if (!next) return null;
-    return offsetMs ? new Date(next.getTime() + offsetMs) : next.getDate(false);
+    return new Date(next.getTime() + offsetMs);
   }
 
   /**
@@ -515,8 +508,8 @@ class Cron<T = undefined> {
    * Schedule a new job
    *
    * @param func - Function to be run each iteration of pattern
-   * @param now - Optional clock reading to schedule from, so a clock step between the trigger
-   *              check and this re-arming cannot skip an occurrence
+   * @param now - Optional clock reading to arm from; the trigger check passes its own
+   *              reading, so a clock step before re-arming cannot skip an occurrence
    */
   public schedule(func?: CronCallback<T>, now?: Date): Cron<T> {
     // If a function is already scheduled, bail out
@@ -530,18 +523,18 @@ class Cron<T = undefined> {
       this.fn = func;
     }
 
-    // Derive the delay and the target from a single clock reading: with separate reads, a forward
-    // clock step (NTP correction, host resync) between them could skip the armed occurrence
+    // One clock reading for both the target and its delay: with separate reads, a forward
+    // clock step (NTP correction, host resync) between them can skip the armed occurrence
     // (#343, #370).
     const currentTime = now ?? new Date();
     const target = this._nextTarget(this._states.currentRun, currentTime);
 
-    // Bail out if there is no next run; isNaN guards against unresolvable targets
+    // No next run, or an unresolvable target (isNaN guards against infinite loops)
     if (target === null || isNaN(target.getTime())) return this;
 
-    // Clamp the delay to setTimeout-safe bounds: capped at maxDelay, never negative — some
-    // runtimes (e.g. Deno) wrap large negatives into huge positives. A paused job backs off
-    // 1 s instead of re-arming in a tight loop.
+    // Keep the delay setTimeout-safe: capped at maxDelay, never negative — some runtimes
+    // (e.g. Deno) wrap large negatives into huge positives. A paused job backs off 1 s
+    // instead of re-arming in a tight loop.
     let waitMs = Math.min(Math.max(target.getTime() - currentTime.getTime(), 0), maxDelay);
     if (waitMs === 0 && this._states.paused) waitMs = 1000;
 
@@ -564,15 +557,10 @@ class Cron<T = undefined> {
   private async _trigger(initiationDate?: Date) {
     this._states.blocking = true;
 
-    // Anchor the run at the trigger check's clock reading when one is supplied
-    // (scheduled runs), so a forward clock step between the check and here
-    // cannot advance the recorded run time past upcoming occurrences. Manual
-    // trigger() passes nothing and keeps reading the clock — the behavior fake
-    // timer setups rely on.
-    this._states.currentRun = new CronDate<T>(
-      initiationDate ?? void 0,
-      this.getTz(),
-    );
+    // Scheduled runs anchor the run at the trigger check's clock reading, so a forward
+    // clock step between the check and here cannot advance the recorded run time past
+    // upcoming occurrences. Manual trigger() reads the clock — what fake-timer setups rely on.
+    this._states.currentRun = new CronDate<T>(initiationDate, this.getTz());
 
     try {
       if (this.options.catch) {
@@ -634,8 +622,7 @@ class Cron<T = undefined> {
         this._states.maxRuns--;
       }
 
-      // We do not await this. Passing the check's clock reading anchors the
-      // recorded run at the same instant the fire was decided on
+      // Not awaited. The check's clock reading anchors the recorded run time.
       this._trigger(now);
     } else {
       // If this trigger were blocked, and protect is a function, trigger protect (without awaiting it, even if it's an synchronous function)
@@ -644,18 +631,14 @@ class Cron<T = undefined> {
       }
     }
 
-    // Re-arm with the same clock reading the check used, so a clock step in
-    // between cannot skip an occurrence
+    // Re-arm from the same reading, so a clock step in between cannot skip an occurrence
     this.schedule(undefined, now);
   }
 
   /**
    * Internal version of next. Cron needs millseconds internally, hence _next.
    */
-  private _next(
-    previousRun?: CronDate<T> | Date | string | null,
-    now?: Date,
-  ) {
+  private _next(previousRun?: CronDate<T> | Date | string | null, now?: Date) {
     let hasPreviousRun = (previousRun || this._states.currentRun) ? true : false;
 
     // If no previous run, and startAt and interval is set, calculate when the last run should have been
@@ -665,8 +648,7 @@ class Cron<T = undefined> {
       startAtInFutureWithInterval = (!previousRun) ? true : false;
     }
 
-    // Ensure previous run is a CronDate, anchored at the caller's clock reading
-    // when no previous run is known
+    // Ensure previous run is a CronDate, anchored at the caller's clock reading when none is known
     previousRun = new CronDate<T>(previousRun ?? now, this.getTz());
 
     // Previous run should never be before startAt
@@ -816,8 +798,8 @@ class Cron<T = undefined> {
     hasPreviousRun: boolean,
     now?: Date,
   ): [CronDate<T> | undefined, boolean] {
-    // Anchor the walk at the caller's clock reading, so a forward clock step
-    // between the arming reads cannot advance it past the pending occurrence
+    // Anchor the walk at the caller's clock reading, not a fresh one that a
+    // forward step may have advanced past the pending occurrence
     const nowDate = new CronDate<T>(now, this.getTz());
     let newPrev: CronDate<T> | undefined | null = prev as CronDate<T>;
     if ((this.options.startAt as CronDate<T>).getTime() <= nowDate.getTime()) {

@@ -6,16 +6,16 @@ import { Cron } from "../src/croner.ts";
  * Regression tests for #343/#370: croner used to read the system clock several
  * times while arming and running a scheduled occurrence. A forward clock step
  * (NTP correction, WSL2 host clock resync, ...) between two of those reads made
- * it re-arm for the occurrence after the one just stepped over, so the scheduled
+ * it re-arm for the occurrence after the one just stepped over, so the
  * occurrence was silently skipped: no fire, no error.
  *
- * The step is injected by patching Date: within a configurable window before the
- * occurrence, the clock jumps forward across it on the second consecutive read,
- * i.e. between two of croner's reads. Dates built from an explicit timestamp
- * bypass the patch, so job inputs can be constructed while it is active.
+ * The step is injected by patching Date: within a configurable window before
+ * the occurrence, the clock jumps forward across it on the second consecutive
+ * read. Dates built from an explicit timestamp bypass the patch, so job inputs
+ * can be constructed while it is active.
  */
 
-/** Whole-second occurrence `seconds` out, inside the 30 s arming window */
+/** Whole-second occurrence `seconds` out, so the job fires on a second boundary */
 function targetSecondsOut(RealDate: DateConstructor, seconds: number): number {
   const target = new RealDate();
   target.setSeconds(target.getSeconds() + seconds, 0);
@@ -67,15 +67,14 @@ function patchClockToStepAcross(
  * Start a job while the clock is patched to step across its occurrence, then
  * assert it fires exactly `expectedFires` times.
  *
- * The occurrence is ~2 s out: inside the 30 s arming window, while keeping the
- * whole test under bun:test's 5 s default timeout, which @cross/test cannot
- * raise.
+ * The occurrence is ~2 s out — inside the default 30 s step window, while
+ * keeping the whole test under bun:test's 5 s default timeout, which
+ * @cross/test cannot raise.
  */
 async function assertFiresDespiteClockStep(
   start: (targetMs: number, onFire: () => void) => Cron,
-  options: { expectedFires?: number; windowMs?: number } = {},
+  { expectedFires = 1, windowMs = 30_000 }: { expectedFires?: number; windowMs?: number } = {},
 ) {
-  const { expectedFires = 1, windowMs = 30_000 } = options;
   const RealDate = Date;
   const targetMs = targetSecondsOut(RealDate, 2);
 
@@ -84,40 +83,28 @@ async function assertFiresDespiteClockStep(
   let job: Cron | undefined;
   try {
     job = start(targetMs, () => fired++);
-    await assertFiresExactly(targetMs, expectedFires, () => fired, () => RealDate.now());
+
+    // Poll until the expected count, or 1.5 s past the occurrence: a build
+    // that skips it stays unfired until the deadline and still fails below
+    const deadline = targetMs + 1_500;
+    while (RealDate.now() < deadline && fired < expectedFires) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    }
+    // Give same-tick duplicate fires a moment to surface before asserting
+    await new Promise<void>((resolve) => setTimeout(resolve, 400));
+
+    assertEquals(
+      fired,
+      expectedFires,
+      fired < expectedFires
+        ? "occurrence silently skipped: the clock stepped forward across it " +
+          "between croner's arming reads"
+        : "job fired more times than scheduled",
+    );
   } finally {
     restoreClock();
     job?.stop();
   }
-}
-
-/**
- * Poll in real time until the job has fired `expectedFires` times, or the
- * deadline passes 1.5 s past the occurrence. A build that skips the occurrence
- * stays short of the count until then, so the assertion still fails.
- */
-async function assertFiresExactly(
-  targetMs: number,
-  expectedFires: number,
-  firedCount: () => number,
-  realNow: () => number,
-) {
-  const deadline = targetMs + 1_500;
-  while (realNow() < deadline && firedCount() < expectedFires) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 50));
-  }
-  // Give same-tick duplicate fires a moment to surface before asserting
-  await new Promise<void>((resolve) => setTimeout(resolve, 400));
-
-  assertEquals(
-    firedCount(),
-    expectedFires,
-    firedCount() < expectedFires
-      ? "occurrence silently skipped: the clock stepped forward across it " +
-        "between croner's arming reads, and the job never fired" +
-        (expectedFires > 1 ? ` (expected ${expectedFires} fires, got ${firedCount()})` : "")
-      : "job fired more times than scheduled",
-  );
 }
 
 test("clock step forward between arming reads must not skip the occurrence", () =>
@@ -127,10 +114,9 @@ test("clock step forward between arming reads must not skip the occurrence", () 
 
 test("clock step forward between arming reads must not skip the occurrence (startAt + interval)", () =>
   assertFiresDespiteClockStep((targetMs, onFire) => {
-    // Same race through _calculatePreviousRun(): with a past startAt and an
-    // interval, it used to sample the clock on its own, so a forward step
-    // between schedule()'s reading and the walk advanced the walk past the
-    // pending run
+    // Same race through _calculatePreviousRun(): it used to sample the clock
+    // on its own, so a forward step between schedule()'s reading and the walk
+    // advanced the walk past the pending run
     return new Cron("* * * * * *", { startAt: new Date(targetMs - 10_000), interval: 5 }, onFire);
   }));
 
@@ -138,11 +124,11 @@ test("clock step forward between the trigger check and the run must not skip the
   assertFiresDespiteClockStep(
     (_targetMs, onFire) => new Cron("* * * * * *", onFire),
     {
-      // The per-second pattern makes the occurrence ~2 s out fire first, so the
-      // step lands between the clock read of that run's trigger check and the
-      // read that used to record the run's own start time (currentRun) — the
-      // gap left after arming became single-read. The 1 s window keeps the
-      // arming reads (~2 s out) outside the jump zone.
+      // Arming is single-read, so the step is injected one read later:
+      // between the trigger check of the occurrence ~2 s out and the read that
+      // records its run time. The 1 s window keeps the arming reads outside
+      // the jump zone, and both the stepped-over and the next occurrence
+      // must fire.
       expectedFires: 2,
       windowMs: 1_000,
     },
