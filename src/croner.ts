@@ -240,6 +240,31 @@ class Cron<T = undefined> {
   }
 
   /**
+   * Internal timer target: the next occurrence of the (dayOffset-)shifted schedule
+   * after `now`, derived from the same single clock reading as the delay.
+   *
+   * `nextRun()` applies dayOffset for presentation, which would desync the timer
+   * target from the wall clock: a negative offset keeps the target in the past
+   * (waitMs clamps to 0, hot-looping) and a positive one keeps it forever ahead.
+   * Instead, the pattern walk is anchored at the inverse-shifted previous run and
+   * clock reading, and the offset is re-applied to the result, yielding a real
+   * point in time the wall clock can reach. With no dayOffset this is plain
+   * `_next()`.
+   */
+  private _nextTarget(
+    prev: CronDate<T> | undefined,
+    now: Date,
+  ): Date | null {
+    const offsetMs = (this.options.dayOffset ?? 0) * 24 * 60 * 60 * 1000;
+    const next = this._next(
+      offsetMs && prev ? new Date(prev.getTime() - offsetMs) : prev,
+      offsetMs ? new Date(now.getTime() - offsetMs) : now,
+    );
+    if (!next) return null;
+    return offsetMs ? new Date(next.getTime() + offsetMs) : next.getDate(false);
+  }
+
+  /**
    * Find next n runs, based on supplied date. Strips milliseconds.
    *
    * @param n - Number of runs to enumerate
@@ -509,7 +534,7 @@ class Cron<T = undefined> {
     // clock step (NTP correction, host resync) between them could skip the armed occurrence
     // (#343, #370).
     const currentTime = now ?? new Date();
-    const target = this.nextRun(this._states.currentRun, currentTime);
+    const target = this._nextTarget(this._states.currentRun, currentTime);
 
     // Bail out if there is no next run; isNaN guards against unresolvable targets
     if (target === null || isNaN(target.getTime())) return this;
@@ -539,8 +564,13 @@ class Cron<T = undefined> {
   private async _trigger(initiationDate?: Date) {
     this._states.blocking = true;
 
+    // Anchor the run at the trigger check's clock reading when one is supplied
+    // (scheduled runs), so a forward clock step between the check and here
+    // cannot advance the recorded run time past upcoming occurrences. Manual
+    // trigger() passes nothing and keeps reading the clock — the behavior fake
+    // timer setups rely on.
     this._states.currentRun = new CronDate<T>(
-      void 0, // We should use initiationDate, but that does not play well with fake timers in third party tests. In real world there is not much difference though */
+      initiationDate ?? void 0,
       this.getTz(),
     );
 
@@ -604,8 +634,9 @@ class Cron<T = undefined> {
         this._states.maxRuns--;
       }
 
-      // We do not await this
-      this._trigger();
+      // We do not await this. Passing the check's clock reading anchors the
+      // recorded run at the same instant the fire was decided on
+      this._trigger(now);
     } else {
       // If this trigger were blocked, and protect is a function, trigger protect (without awaiting it, even if it's an synchronous function)
       if (shouldRun && isBlocked && isFunction(this.options.protect)) {

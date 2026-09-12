@@ -261,3 +261,31 @@ test("dayOffset should maintain consistency across multiple DST transitions", fu
     );
   }
 });
+
+/**
+ * Live-scheduling regression: the timer target must be the next occurrence of
+ * the shifted schedule, not nextRun()'s offset presentation value. Feeding the
+ * shifted value to the timer desynced it from the wall clock — a negative
+ * dayOffset kept the target in the past (waitMs clamped to 0, firing in a tight
+ * loop) while a positive one kept it forever ahead of every poll (stalling).
+ */
+for (const dayOffset of [-1, 1]) {
+  test(`dayOffset ${dayOffset} must fire per occurrence, not stall or hot-loop`, async function () {
+    let fired = 0;
+    const job = new Cron("* * * * * *", { dayOffset }, () => {
+      fired++;
+    });
+    try {
+      await new Promise<void>((resolve) => setTimeout(resolve, 3_500));
+    } finally {
+      job.stop();
+    }
+    // ~3.5 s of per-second occurrences: a stalling build fires 0 times, a
+    // hot-looping one hundreds. The generous bounds absorb CI scheduling jitter
+    assertEquals(
+      fired >= 2 && fired <= 6,
+      true,
+      `expected 2-6 fires in 3.5 s for dayOffset ${dayOffset}, got ${fired}`,
+    );
+  });
+}

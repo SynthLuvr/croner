@@ -3,17 +3,16 @@ import { test } from "@cross/test";
 import { Cron } from "../src/croner.ts";
 
 /**
- * Regression tests for #343/#370: schedule() used to read the clock twice, once
- * for the trigger delay and once for the trigger target. A forward clock step
- * (NTP correction, WSL2 host clock resync, ...) between those reads made it
- * re-arm for the occurrence after the one just stepped over, so the scheduled
+ * Regression tests for #343/#370: croner used to read the system clock several
+ * times while arming and running a scheduled occurrence. A forward clock step
+ * (NTP correction, WSL2 host clock resync, ...) between two of those reads made
+ * it re-arm for the occurrence after the one just stepped over, so the scheduled
  * occurrence was silently skipped: no fire, no error.
  *
- * The step is injected by patching Date: the clock jumps forward across the
- * occurrence on the second consecutive read within the final 30 seconds (the
- * maxDelay polling cap) before it, i.e. between schedule()'s arming reads.
- * Dates built from an explicit timestamp bypass the patch, so job inputs can
- * be constructed while it is active.
+ * The step is injected by patching Date: within a configurable window before the
+ * occurrence, the clock jumps forward across it on the second consecutive read,
+ * i.e. between two of croner's reads. Dates built from an explicit timestamp
+ * bypass the patch, so job inputs can be constructed while it is active.
  */
 
 /** Whole-second occurrence `seconds` out, inside the 30 s arming window */
@@ -25,13 +24,17 @@ function targetSecondsOut(RealDate: DateConstructor, seconds: number): number {
 
 /**
  * Patch globalThis.Date so the clock jumps forward across targetMs on the
- * second consecutive read within the 30 s before it. Returns a restore fn.
+ * second consecutive read within `windowMs` before it. Returns a restore fn.
  */
-function patchClockToStepAcross(RealDate: DateConstructor, targetMs: number): () => void {
+function patchClockToStepAcross(
+  RealDate: DateConstructor,
+  targetMs: number,
+  windowMs = 30_000,
+): () => void {
   let offsetMs = 0, jumped = false, lastReadInWindow = false;
   const readClock = (): number => {
     const gap = targetMs - (RealDate.now() + offsetMs);
-    const inWindow = gap > 0 && gap <= 30_000;
+    const inWindow = gap > 0 && gap <= windowMs;
     // Step the clock across the occurrence on the second consecutive read in
     // the window, mimicking a step between croner's arming reads
     if (!jumped && inWindow && lastReadInWindow) {
@@ -62,7 +65,7 @@ function patchClockToStepAcross(RealDate: DateConstructor, targetMs: number): ()
 
 /**
  * Start a job while the clock is patched to step across its occurrence, then
- * assert it fires exactly once.
+ * assert it fires exactly `expectedFires` times.
  *
  * The occurrence is ~2 s out: inside the 30 s arming window, while keeping the
  * whole test under bun:test's 5 s default timeout, which @cross/test cannot
@@ -70,16 +73,18 @@ function patchClockToStepAcross(RealDate: DateConstructor, targetMs: number): ()
  */
 async function assertFiresDespiteClockStep(
   start: (targetMs: number, onFire: () => void) => Cron,
+  options: { expectedFires?: number; windowMs?: number } = {},
 ) {
+  const { expectedFires = 1, windowMs = 30_000 } = options;
   const RealDate = Date;
   const targetMs = targetSecondsOut(RealDate, 2);
 
   let fired = 0;
-  const restoreClock = patchClockToStepAcross(RealDate, targetMs);
+  const restoreClock = patchClockToStepAcross(RealDate, targetMs, windowMs);
   let job: Cron | undefined;
   try {
     job = start(targetMs, () => fired++);
-    await assertFiresOnce(targetMs, () => fired, () => RealDate.now());
+    await assertFiresExactly(targetMs, expectedFires, () => fired, () => RealDate.now());
   } finally {
     restoreClock();
     job?.stop();
@@ -87,29 +92,31 @@ async function assertFiresDespiteClockStep(
 }
 
 /**
- * Poll in real time until the job fires, or the deadline passes 1.5 s past the
- * occurrence. A build that skips the occurrence stays unfired until then, so
- * the assertion still fails.
+ * Poll in real time until the job has fired `expectedFires` times, or the
+ * deadline passes 1.5 s past the occurrence. A build that skips the occurrence
+ * stays short of the count until then, so the assertion still fails.
  */
-async function assertFiresOnce(
+async function assertFiresExactly(
   targetMs: number,
+  expectedFires: number,
   firedCount: () => number,
   realNow: () => number,
 ) {
   const deadline = targetMs + 1_500;
-  while (realNow() < deadline && firedCount() === 0) {
+  while (realNow() < deadline && firedCount() < expectedFires) {
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
   }
-  // Give a same-tick duplicate fire a moment to surface before asserting
+  // Give same-tick duplicate fires a moment to surface before asserting
   await new Promise<void>((resolve) => setTimeout(resolve, 400));
 
   assertEquals(
     firedCount(),
-    1,
-    firedCount() === 0
+    expectedFires,
+    firedCount() < expectedFires
       ? "occurrence silently skipped: the clock stepped forward across it " +
-        "between croner's arming reads, and the job never fired"
-      : "job fired more than once",
+        "between croner's arming reads, and the job never fired" +
+        (expectedFires > 1 ? ` (expected ${expectedFires} fires, got ${firedCount()})` : "")
+      : "job fired more times than scheduled",
   );
 }
 
@@ -126,3 +133,17 @@ test("clock step forward between arming reads must not skip the occurrence (star
     // pending run
     return new Cron("* * * * * *", { startAt: new Date(targetMs - 10_000), interval: 5 }, onFire);
   }));
+
+test("clock step forward between the trigger check and the run must not skip the next occurrence", () =>
+  assertFiresDespiteClockStep(
+    (_targetMs, onFire) => new Cron("* * * * * *", onFire),
+    {
+      // The per-second pattern makes the occurrence ~2 s out fire first, so the
+      // step lands between the clock read of that run's trigger check and the
+      // read that used to record the run's own start time (currentRun) — the
+      // gap left after arming became single-read. The 1 s window keeps the
+      // arming reads (~2 s out) outside the jump zone.
+      expectedFires: 2,
+      windowMs: 1_000,
+    },
+  ));
