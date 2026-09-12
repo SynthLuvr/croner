@@ -631,7 +631,7 @@ class Cron<T = undefined> {
     // If no previous run, and startAt and interval is set, calculate when the last run should have been
     let startAtInFutureWithInterval = false;
     if (!previousRun && this.options.startAt && this.options.interval) {
-      [previousRun, hasPreviousRun] = this._calculatePreviousRun(previousRun, hasPreviousRun);
+      [previousRun, hasPreviousRun] = this._calculatePreviousRun(previousRun, hasPreviousRun, now);
       startAtInFutureWithInterval = (!previousRun) ? true : false;
     }
 
@@ -784,13 +784,16 @@ class Cron<T = undefined> {
   private _calculatePreviousRun(
     prev: CronDate<T> | Date | string | undefined | null,
     hasPreviousRun: boolean,
+    now?: Date,
   ): [CronDate<T> | undefined, boolean] {
-    const now = new CronDate<T>(undefined, this.getTz());
+    // Anchor the walk at the caller's clock reading when supplied: with a fresh read, a forward
+    // clock step between the arming reads could advance the walk past the pending occurrence
+    const nowDate = new CronDate<T>(now, this.getTz());
     let newPrev: CronDate<T> | undefined | null = prev as CronDate<T>;
-    if ((this.options.startAt as CronDate<T>).getTime() <= now.getTime()) {
+    if ((this.options.startAt as CronDate<T>).getTime() <= nowDate.getTime()) {
       newPrev = this.options.startAt as CronDate<T>;
       let prevTimePlusInterval = (newPrev as CronDate<T>).getTime() + this.options.interval! * 1000;
-      while (prevTimePlusInterval <= now.getTime()) {
+      while (prevTimePlusInterval <= nowDate.getTime()) {
         newPrev = new CronDate<T>(newPrev, this.getTz())
           .increment(
             this._states.pattern,

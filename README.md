@@ -104,7 +104,7 @@ Cron takes three arguments
 const job = new Cron("* * * * * *", { maxRuns: 1 }, () => {} );
 
 // If function is omitted in constructor, it can be scheduled later
-job.schedule(job, /* optional */ context) => {});
+job.schedule(() => { /* ... */ });
 ```
 
 The job will be sceduled to run at next matching time unless you supply option `{ paused: true }`. The `new Cron(...)` constructor will return a Cron instance, later called `job`, which have a couple of methods and properties listed below.
@@ -112,7 +112,7 @@ The job will be sceduled to run at next matching time unless you supply option `
 #### Status
 
 ```javascript
-job.nextRun( /*optional*/ startFromDate );	// Get a Date object representing the next run.
+job.nextRun( /*optional*/ startFromDate, /*optional*/ now );	// Get a Date object representing the next run.
 job.nextRuns(10, /*optional*/ startFromDate ); // Get an array of Dates, containing the next n runs.
 job.previousRuns(10, /*optional*/ referenceDate ); // Get an array of Dates, containing previous n scheduled runs.
 job.enumerate( /*optional*/ startFromDate ); // Get a stateful CronIterator for use in for...of / destructuring.
@@ -129,6 +129,8 @@ job.isBusy(); 		// Indicates if the job is currently busy doing work (true or fa
 job.getPattern(); 	// Returns the original pattern string
 job.getOnce(); 		// Returns the original run-once date (Date or null)
 ```
+
+Both `nextRun()` and `schedule()` accept an optional `now` date as their last parameter, which pins the calculation to that clock reading instead of the current time. Croner uses this internally to derive the trigger target and its delay from a single clock read, so a forward clock step (NTP correction, host resync) between arming reads cannot silently skip an occurrence. Supply it yourself only if you need the same guarantee when calculating delays from `nextRun()`.
 
 #### Control functions
 
