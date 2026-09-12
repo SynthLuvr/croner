@@ -12,14 +12,14 @@ import { Cron } from "../src/croner.ts";
  * The step is injected by patching Date: the clock jumps forward across the
  * occurrence on the second consecutive read within the final 30 seconds (the
  * maxDelay polling cap) before it, i.e. between schedule()'s arming reads.
+ * Dates built from an explicit timestamp bypass the patch, so job inputs can
+ * be constructed while it is active.
  */
 
-/** Occurrence a whole number of seconds out, kept inside the 30 s arming window */
+/** Whole-second occurrence `seconds` out, inside the 30 s arming window */
 function targetSecondsOut(RealDate: DateConstructor, seconds: number): number {
-  const now = new RealDate();
-  const target = new RealDate(now);
-  target.setSeconds(now.getSeconds() + seconds, 0);
-  if (target.getTime() <= now.getTime()) target.setMinutes(target.getMinutes() + 1);
+  const target = new RealDate();
+  target.setSeconds(target.getSeconds() + seconds, 0);
   return target.getTime();
 }
 
@@ -60,51 +60,31 @@ function patchClockToStepAcross(RealDate: DateConstructor, targetMs: number): ()
   };
 }
 
-test("clock step forward between arming reads must not skip the occurrence", async () => {
+/**
+ * Start a job while the clock is patched to step across its occurrence, then
+ * assert it fires exactly once.
+ *
+ * The occurrence is ~2 s out: inside the 30 s arming window, while keeping the
+ * whole test under bun:test's 5 s default timeout, which @cross/test cannot
+ * raise.
+ */
+async function assertFiresDespiteClockStep(
+  start: (targetMs: number, onFire: () => void) => Cron,
+) {
   const RealDate = Date;
-
-  // Occurrence ~2 s out: inside the 30 s arming window, while keeping the whole
-  // test under bun:test's 5 s default timeout, which @cross/test cannot raise
   const targetMs = targetSecondsOut(RealDate, 2);
 
   let fired = 0;
-  let job: Cron | undefined;
   const restoreClock = patchClockToStepAcross(RealDate, targetMs);
+  let job: Cron | undefined;
   try {
-    job = new Cron(new RealDate(targetMs).getSeconds() + " * * * * *", () => {
-      fired++;
-    });
+    job = start(targetMs, () => fired++);
     await assertFiresOnce(targetMs, () => fired, () => RealDate.now());
   } finally {
     restoreClock();
     job?.stop();
   }
-});
-
-test("clock step forward between arming reads must not skip the occurrence (startAt + interval)", async () => {
-  const RealDate = Date;
-
-  // Same race through _calculatePreviousRun(): with a past startAt and an
-  // interval, it used to sample the clock on its own, so a forward step between
-  // schedule()'s reading and the walk advanced the walk past the pending run
-  const targetMs = targetSecondsOut(RealDate, 2);
-
-  let fired = 0;
-  let job: Cron | undefined;
-  const restoreClock = patchClockToStepAcross(RealDate, targetMs);
-  try {
-    // Built from the patched class (explicit timestamp, so no stepped read),
-    // as the constructor normalizes startAt while Date is patched
-    const startAt = new Date(targetMs - 10_000);
-    job = new Cron("* * * * * *", { startAt, interval: 5 }, () => {
-      fired++;
-    });
-    await assertFiresOnce(targetMs, () => fired, () => RealDate.now());
-  } finally {
-    restoreClock();
-    job?.stop();
-  }
-});
+}
 
 /**
  * Poll in real time until the job fires, or the deadline passes 1.5 s past the
@@ -132,3 +112,17 @@ async function assertFiresOnce(
       : "job fired more than once",
   );
 }
+
+test("clock step forward between arming reads must not skip the occurrence", () =>
+  assertFiresDespiteClockStep((targetMs, onFire) =>
+    new Cron(new Date(targetMs).getSeconds() + " * * * * *", onFire)
+  ));
+
+test("clock step forward between arming reads must not skip the occurrence (startAt + interval)", () =>
+  assertFiresDespiteClockStep((targetMs, onFire) => {
+    // Same race through _calculatePreviousRun(): with a past startAt and an
+    // interval, it used to sample the clock on its own, so a forward step
+    // between schedule()'s reading and the walk advanced the walk past the
+    // pending run
+    return new Cron("* * * * * *", { startAt: new Date(targetMs - 10_000), interval: 5 }, onFire);
+  }));

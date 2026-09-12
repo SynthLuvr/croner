@@ -514,10 +514,9 @@ class Cron<T = undefined> {
     // Bail out if there is no next run; isNaN guards against unresolvable targets
     if (target === null || isNaN(target.getTime())) return this;
 
-    // Clamp the delay to what setTimeout can handle: overdue runs become an immediate check,
-    // longer waits are capped at maxDelay, and large negatives must be clamped because e.g. Deno
-    // wraps them to huge positives (32-bit overflow), hanging far-past allowPast jobs. Paused
-    // jobs back off instead of looping tightly.
+    // Clamp the delay to setTimeout-safe bounds: capped at maxDelay, never negative — some
+    // runtimes (e.g. Deno) wrap large negatives into huge positives. A paused job backs off
+    // 1 s instead of re-arming in a tight loop.
     let waitMs = Math.min(Math.max(target.getTime() - currentTime.getTime(), 0), maxDelay);
     if (waitMs === 0 && this._states.paused) waitMs = 1000;
 
@@ -786,8 +785,8 @@ class Cron<T = undefined> {
     hasPreviousRun: boolean,
     now?: Date,
   ): [CronDate<T> | undefined, boolean] {
-    // Anchor the walk at the caller's clock reading when supplied: with a fresh read, a forward
-    // clock step between the arming reads could advance the walk past the pending occurrence
+    // Anchor the walk at the caller's clock reading, so a forward clock step
+    // between the arming reads cannot advance it past the pending occurrence
     const nowDate = new CronDate<T>(now, this.getTz());
     let newPrev: CronDate<T> | undefined | null = prev as CronDate<T>;
     if ((this.options.startAt as CronDate<T>).getTime() <= nowDate.getTime()) {
